@@ -54,6 +54,7 @@ void ChatClient::initDatabase()
         query.exec("CREATE TABLE IF NOT EXISTS messages ("
                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
                    "sender TEXT, "
+                   "target TEXT, "
                    "message TEXT, "
                    "timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)");
     } else {
@@ -69,12 +70,12 @@ void ChatClient::connectToServer(const QString &ip, quint16 port) {
     }
 }
 
-void ChatClient::sendMessage(const QString &message) {
+void ChatClient::sendMessage(const QString &message,const QString &target) {
     if (m_socket->state() == QAbstractSocket::ConnectedState) {
         QJsonObject json;
         json["sender"] = m_currentUser;
         json["message"] = message;
-
+        json["target"]=target;
         // 使用换行符分割 JSON 消息，防止粘包
         QByteArray data = QJsonDocument(json).toJson(QJsonDocument::Compact) ;
         QByteArray packet;
@@ -91,71 +92,59 @@ void ChatClient::sendMessage(const QString &message) {
 
         // 保存并显示自己的消息
         m_chatModel->append(m_currentUser, message, true);
-        saveMessageToDb(m_currentUser, message);
+        saveMessageToDb(m_currentUser,target,message);
     }
 }
 
 void ChatClient::onReadyRead() {
-    if (m_heartbeatTimeoutTimer->isActive()) {
-        m_heartbeatTimeoutTimer->start(30000);
-    }
-
     m_buffer.append(m_socket->readAll());
 
-    // 2. 循环处理缓冲区中的完整数据包
     while (true) {
-        // 2.1 检查缓冲区数据是否足够读取一个“总长度”字段
-        if (m_buffer.size() < sizeof(quint32)) {
-            break; // 数据不够，等待下次接收
-        }
+        if (m_buffer.size() < sizeof(quint32)) break;
 
-        // 2.2 预读总长度
         QDataStream in(m_buffer);
         in.setVersion(QDataStream::Qt_6_2);
+
         quint32 totalLength;
-        in >> totalLength;
+        in >> totalLength; // 读了 4 字节，指针在 4
 
-        // 2.3 检查缓冲区数据是否足够一个完整的包
-        if (m_buffer.size() < totalLength) {
-            break; // 数据不完整，等待下次接收
-        }
+        if (m_buffer.size() < totalLength) break;
 
-        // --- 到这里，说明至少有一个完整的包在缓冲区里 ---
-
-        // 3. 读取一个完整的包
-        in.skipRawData(sizeof(quint32)); // 跳过已经读过的长度字段
+        // --- 修正：直接读类型，不要重复读长度 ---
         quint16 messageType;
-        in >> messageType;
+        in >> messageType; // 读了 2 字节，指针在 6
 
-        // 计算消息体的长度并读取
-        QByteArray messageBody = m_buffer.mid(sizeof(quint32) + sizeof(quint16), totalLength - sizeof(quint32) - sizeof(quint16));
+        // 截取消息体：从第 6 个字节开始，长度是 总长 - 6
+        QByteArray messageBody = m_buffer.mid(6, totalLength - 6);
 
-        // 4. 根据消息类型处理消息体
-        if (messageType == 1) { // 是聊天消息
+        if (messageType == 1) {
             QJsonDocument doc = QJsonDocument::fromJson(messageBody);
-            if (!doc.isNull() && doc.isObject()) {
+            if (!doc.isNull()) {
                 QJsonObject json = doc.object();
                 QString sender = json["sender"].toString();
                 QString message = json["message"].toString();
-                if (sender != m_currentUser) { // 过滤自己发的消息（服务器可能会回传）
-                    m_chatModel->append(sender, message, false);
-                    saveMessageToDb(sender, message);
+                QString target = json["target"].toString();
+
+                if (sender != m_currentUser) {
+                    if (target == "broadcast" || target == m_currentUser) {
+                        m_chatModel->append(sender, message, false);
+                    }
                 }
             }
-        } else if (messageType == 2) { // 假设 2 是心跳回包
-            // 处理心跳回包逻辑
-            qDebug() << "收到服务器心跳回包";
+        } else if (messageType == 2) {
+            qDebug() << "收到心跳回包";
         }
 
-        // 5. 从缓冲区中移除已经处理过的数据包
+        // 处理完一个完整的包，从缓冲区移除
         m_buffer.remove(0, totalLength);
     }
 }
 
-void ChatClient::saveMessageToDb(const QString &sender, const QString &message) {
+void ChatClient::saveMessageToDb(const QString &sender, const QString &target,const QString &message) {
     QSqlQuery query;
-    query.prepare("INSERT INTO messages (sender, message) VALUES (:sender, :message)");
+    query.prepare("INSERT INTO messages (sender, target, message) VALUES (:sender, :target, :message)");
     query.bindValue(":sender", sender);
+    query.bindValue(":target", target);
     query.bindValue(":message", message);
     query.exec();
 }
@@ -186,12 +175,16 @@ void ChatClient::loadSettings()
 
 QVariantList ChatClient::loadHistory() {
     QVariantList history;
-    QSqlQuery query("SELECT sender, message FROM messages ORDER BY timestamp ASC");
+    QSqlQuery query("SELECT sender, target, message FROM messages ORDER BY timestamp ASC");
     while (query.next()) {
         QVariantMap map;
         QString sender = query.value(0).toString();
+        QString target = query.value(1).toString();
+        QString message = query.value(2).toString();
+
         map["sender"] = sender;
-        map["message"] = query.value(1).toString();
+        map["target"] = target; // ✅ 将 target 传给 QML
+        map["message"] = message;
         map["isMe"] = (sender == m_currentUser);
         history.append(map);
     }
@@ -218,6 +211,34 @@ void ChatClient::onConnected() {
     if (m_reconnectTimer->isActive()) {
         m_reconnectTimer->stop();
     }
+
+    QByteArray packet;
+    QDataStream out(&packet, QIODevice::WriteOnly);
+    out.setVersion(QDataStream::Qt_6_2);
+
+    QJsonObject json;
+    json["sender"] = m_currentUser;
+    json["message"] = ""; // 或者是你要发的其他信息
+    json["target"] = "";
+
+    // 1. 先生成 JSON 数据
+    QByteArray data = QJsonDocument(json).toJson(QJsonDocument::Compact);
+
+    // 2. 正确计算总长度：长度字段(4) + 类型字段(2) + 数据体长度
+    quint16 messageType = 3;
+    quint32 totalLength = sizeof(quint32) + sizeof(quint16) + data.size(); // 必须用 data.size()
+
+    // 3. 写入二进制头部
+    out << totalLength;
+    out << messageType;
+
+    // 4. 将 JSON 数据追加到包体
+    packet.append(data);
+
+    // 5. 发送
+    m_socket->write(packet);
+
+    m_socket->write(packet);
     m_currentReconnectDelay = 1000; // 重置为 1 秒
     qDebug() << "✅ 連線成功！重連延遲已重置為初始值。";
 

@@ -5,14 +5,14 @@ import QtQuick.Layouts 1.15
 Page {
     id: rootWindow
     title: "QML Chat - " + chatClient.currentUser
+
     // 用於連接 C++ 信號
     Connections {
         target: chatClient
 
         function onMessageReceived(sender, message, isMe) {
-            // 修正：ChatModel.append() 需要三個獨立參數，而不是一個對象
             chatModel.append(sender, message, isMe)
-            listView.positionViewAtEnd() // 滾動到最底部
+            // 這裡不再需要手動調用滾動，交由 ListView 的 onCountChanged 處理
         }
 
         function onConnectionStatusChanged(connected) {
@@ -25,10 +25,11 @@ Page {
         // 加載歷史記錄
         let history = chatClient.loadHistory();
         for (let i = 0; i < history.length; i++) {
-            // 修正：ChatModel.append() 需要三個獨立參數
             chatModel.append(history[i].sender, history[i].message, history[i].isMe);
         }
-        listView.positionViewAtEnd();
+
+        // 初始加載完成後強制滾動到底部
+        Qt.callLater(listView.positionViewAtEnd);
 
         // 自動連接到本地服務器
         chatClient.connectToServer("127.0.0.1", 12345);
@@ -58,15 +59,19 @@ Page {
             id: listView
             Layout.fillWidth: true
             Layout.fillHeight: true
-            model: chatModel//将model赋值给QML
+            model: chatModel
             spacing: 10
             clip: true
             topMargin: 10
             bottomMargin: 10
 
+            // 【新增核心邏輯】：當消息行數變化時，延遲執行滾動到底部
+            // Qt.callLater 確保在 Delegate 渲染完成後才執行滾動，防止跳轉不到位的問題
+            onCountChanged: Qt.callLater(listView.positionViewAtEnd)
+
             delegate: Item {
                 width: listView.width
-                height: bubble.height + 20
+                height: bubble.height + 25
 
                 // 聊天氣泡
                 Rectangle {
@@ -74,19 +79,16 @@ Page {
                     width: Math.min(msgText.implicitWidth + 24, listView.width * 0.7)
                     height: msgText.implicitHeight + 20
                     radius: 10
-                    color: model.isMe ? "#95EC69" : "#FFFFFF" // QQ/微信綠和白
+                    color: model.isMe ? "#95EC69" : "#FFFFFF"
 
-                    // 根據是否是自己發的消息，實現左右對齊
-                    anchors.right: model.isMe ? parent.right : undefined  //此时model就可以直接用 一个model代表一行数据
+                    anchors.right: model.isMe ? parent.right : undefined
                     anchors.left: model.isMe ? undefined : parent.left
                     anchors.rightMargin: 10
                     anchors.leftMargin: 10
 
                     Text {
                         id: msgText
-                        // 注意：這裡使用 model.messageContent 而不是 model.message
-                        // 這對應 C++ ChatModel 中 roleNames() 返回的 "messageContent" 角色
-                        text: model.messageContent //用model里面的哈希值进行转化后的角色
+                        text: model.messageContent
                         wrapMode: Text.Wrap
                         anchors.fill: parent
                         anchors.margins: 10
@@ -96,8 +98,6 @@ Page {
 
                 // 發送者名字顯示
                 Text {
-                    // 注意：這裡使用 model.senderName 而不是 model.sender
-                    // 這對應 C++ ChatModel 中 roleNames() 返回的 "senderName" 角色
                     text: model.senderName
                     font.pixelSize: 10
                     color: "gray"
@@ -114,36 +114,84 @@ Page {
         // 底部輸入區
         Rectangle {
             Layout.fillWidth: true
-            Layout.preferredHeight: 60
+            Layout.preferredHeight: 110
             color: "#FFFFFF"
             border.color: "#E0E0E0"
 
-            RowLayout {
+            ColumnLayout {
                 anchors.fill: parent
                 anchors.margins: 10
-                spacing: 10
+                spacing: 8
 
-                TextField {
-                    id: inputField
+                // 第一行：发送对象
+                RowLayout {
                     Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    placeholderText: "輸入消息..."
-                    font.pixelSize: 15
-                    background: Rectangle {
-                        color: "#F5F5F5"
-                        radius: 5
+                    spacing: 10
+
+                    Text {
+                        text: "发送至:"
+                        font.pixelSize: 14
+                        color: "#666666"
                     }
-                    Keys.onReturnPressed: sendBtn.clicked() // 回車發送
+
+                    TextField {
+                        id: targetField
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 35
+                        placeholderText: "输入用户名 (如: broadcast)"
+                        font.pixelSize: 14
+                        background: Rectangle {
+                            color: "#F9F9F9"
+                            radius: 5
+                            border.color: targetField.activeFocus ? "#95EC69" : "#E0E0E0"
+                        }
+                    }
                 }
 
-                Button {
-                    id: sendBtn
-                    text: "發送"
-                    Layout.preferredWidth: 80
-                    Layout.fillHeight: true
-                    onClicked: {
-                        if (inputField.text.trim() !== "") {
-                            chatClient.sendMessage(inputField.text.trim())
+                // 第二行：消息输入和发送按钮
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+
+                    TextField {
+                        id: inputField
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 40
+                        placeholderText: "輸入消息..."
+                        font.pixelSize: 15
+                        background: Rectangle {
+                            color: "#F5F5F5"
+                            radius: 5
+                        }
+                        Keys.onReturnPressed: sendBtn.clicked()
+                    }
+
+                    Button {
+                        id: sendBtn
+                        text: "發送"
+                        Layout.preferredWidth: 80
+                        Layout.preferredHeight: 40
+
+                        // 只有消息和接收者都不为空时按钮才可用
+                        enabled: inputField.text.trim() !== "" && targetField.text.trim() !== ""
+
+                        contentItem: Text {
+                            text: sendBtn.text
+                            font.bold: true
+                            color: "white"
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                            opacity: sendBtn.enabled ? 1.0 : 0.5
+                        }
+
+                        background: Rectangle {
+                            color: sendBtn.enabled ? "#07C160" : "#CCCCCC"
+                            radius: 5
+                        }
+
+                        onClicked: {
+                            let target = targetField.text.trim();
+                            chatClient.sendMessage(inputField.text.trim(), target);
                             inputField.text = ""
                         }
                     }

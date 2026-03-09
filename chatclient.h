@@ -25,7 +25,7 @@ public:
 
     // 暴露给 QML 调用的函数
     Q_INVOKABLE void connectToServer(const QString &ip, quint16 port);
-    Q_INVOKABLE void sendMessage(const QString &message);
+    Q_INVOKABLE void sendMessage(const QString &message,const QString &target);
     Q_INVOKABLE QVariantList loadHistory(); // 加载本地聊天记录
     Q_INVOKABLE void loadHistoryToModel();
 
@@ -46,7 +46,7 @@ private slots:
 private:
     QByteArray m_buffer;
     void initDatabase();
-    void saveMessageToDb(const QString &sender, const QString &message);
+    void saveMessageToDb(const QString &sender,const QString &target, const QString &message);
     void saveSettings(); // 用于保存配置
     void loadSettings(); // 用于加载配置
     QTcpSocket *m_socket;
