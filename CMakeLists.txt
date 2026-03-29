@@ -15,6 +15,10 @@ qt_add_executable(appQmlChatApp
     main.cpp
     chatclient.h chatclient.cpp
     chatmodel.h chatmodel.cpp
+    databasemanager.h databasemanager.cpp
+    protocolhandler.h protocolhandler.cpp
+    backendworker.h backendworker.cpp
+
 )
 
 # 2. 将资源直接附加到目标程序 (这是 Qt6 的正确语法，解决 // 报错的核心)
@@ -25,6 +29,8 @@ qt_add_resources(appQmlChatApp "app_resources"
         chat.qml
         regist.qml
         logintest.jpg
+        desktop.qml
+        AddFriendPage.qml
 )
 
 # 3. 链接 Qt 库

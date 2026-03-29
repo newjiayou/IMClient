@@ -1,38 +1,90 @@
 #include "ChatClient.h"
+#include "BackendWorker.h"   // 引入 Worker
+#include "DatabaseManager.h" // 引入 MessageRecord 结构体定义
 #include <QSqlQuery>
 #include <QSqlError>
 #include <QDebug>
 #include <QDir>
 #include <QDataStream>
-#include <QNetworkProxy> // <--- 必须添加这个头文件
+#include <QNetworkProxy>
+#include <QDateTime>
+
 ChatClient::ChatClient(QObject *parent) : QObject(parent), m_socket(new QTcpSocket(this))
 {
-    initDatabase();
-    m_chatModel = new chatmodel(this);  // 创建 model 实例
+    m_chatModel = new chatmodel(this);
     m_socket->setProxy(QNetworkProxy::NoProxy);
-    // 1. 初始化重連計時器
-    m_currentReconnectDelay = 1000; // 初始重连延迟设为 1 秒 (1000ms)
+
+    // 1. 初始化各类定时器
+    m_currentReconnectDelay = 1000;
     m_reconnectTimer = new QTimer(this);
-    m_reconnectTimer->setSingleShot(true); // 设为单次触发，由我们手动控制下一次触发的时间
+    m_reconnectTimer->setSingleShot(true);
     connect(m_reconnectTimer, &QTimer::timeout, this, &ChatClient::attemptReconnection);
+
     m_heartbeatTimer = new QTimer(this);
     m_heartbeatTimeoutTimer = new QTimer(this);
-    m_heartbeatTimeoutTimer->setSingleShot(true); // 设为单次触发，每次收到数据时重置它
+    m_heartbeatTimeoutTimer->setSingleShot(true);
     connect(m_heartbeatTimer, &QTimer::timeout, this, &ChatClient::sendHeartbeat);
     connect(m_heartbeatTimeoutTimer, &QTimer::timeout, this, &ChatClient::onHeartbeatTimeout);
 
-    // ✅ 新增：监听错误信号
+    // 2. 绑定 Socket 信号
     connect(m_socket, &QAbstractSocket::errorOccurred, this, &ChatClient::onErrorOccurred);
     connect(m_socket, &QTcpSocket::readyRead, this, &ChatClient::onReadyRead);
     connect(m_socket, &QTcpSocket::connected, this, &ChatClient::onConnected);
     connect(m_socket, &QTcpSocket::disconnected, this, &ChatClient::onDisconnected);
 
-    // loadSettings();
+    // ==========================================
+    // 3. 核心：初始化多线程架构
+    // ==========================================
+    m_workerThread = new QThread(this);
+    m_worker = new BackendWorker();
+
+    // 【关键科学步骤】将 Worker 对象的执行上下文强行转移到子线程
+    m_worker->moveToThread(m_workerThread);
+
+    // 绑定：主线程发指令 -> 子线程执行 (Qt底层自动排队，深拷贝参数)
+    connect(this, &ChatClient::processNetworkBuffer, m_worker, &BackendWorker::onProcessNetworkBuffer);
+    connect(this, &ChatClient::initializeDatabase, m_worker, &BackendWorker::onInitializeDatabase);
+    // connect(this, &ChatClient::saveOutgoingMessage, m_worker, &BackendWorker::onSaveOutgoingMessage);
+    connect(this, &ChatClient::loadInitialHistory, m_worker, &BackendWorker::onLoadInitialHistory);
+
+    // 绑定：子线程出结果 -> 主线程更新UI (Qt底层自动切回主线程执行这些槽函数)
+    connect(m_worker, &BackendWorker::loginResult, this, &ChatClient::onLoginResult);
+    connect(m_worker, &BackendWorker::historyLoaded, this, &ChatClient::onHistoryLoaded);
+    connect(m_worker, &BackendWorker::newMessageReceived, this, &ChatClient::onNewMessageReceived);
+    connect(m_worker, &BackendWorker::requestIncrementalHistory, this, &ChatClient::onRequestIncrementalHistory);
+    connect(m_worker, &BackendWorker::serverHeartbeat, this, [this](){
+        // qDebug() << "❤️[主线程] 收到心跳回包信号，重置超时定时器。";
+        if(m_socket->state() == QAbstractSocket::ConnectedState) m_heartbeatTimeoutTimer->start(30000);
+    });
+    connect(m_worker, &BackendWorker::friendListUpdated, this, [this](const QStringList &list){
+        m_friendList = list;
+        emit friendListChanged();
+    });
+    connect(m_worker, &BackendWorker::friendActionResults, this, &ChatClient::friendActionResults);
+    // 确保线程退出时，Worker 内存被安全释放
+    connect(m_workerThread, &QThread::finished, m_worker, &QObject::deleteLater);
+
+    // 启动物理线程，开启事件循环
+    m_workerThread->start();
+    qDebug() << "[主线程] 后台工作线程已成功启动。";
 }
 
 ChatClient::~ChatClient() {
     saveSettings();
-    m_db.close();
+
+    // 安全退出多线程
+    if(m_workerThread->isRunning()) {
+        m_workerThread->quit(); // 告诉子线程事件循环：准备下班
+        m_workerThread->wait(); // 主线程阻塞等待，直到子线程真正完全退出，防止内存泄漏或崩溃
+    }
+}
+
+void ChatClient::loadConfigAndConnect()
+{
+    QSettings settings("MyChatApp", "QmlChatClient");
+    QString serverIp = settings.value("server/ip", "192.168.56.101").toString();
+    quint16 serverPort = static_cast<quint16>(settings.value("server/port", 12345).toUInt());
+    connectToServer(serverIp, serverPort);
 }
 
 QString ChatClient::currentUser() const { return m_currentUser; }
@@ -44,285 +96,183 @@ void ChatClient::setCurrentUser(const QString &user) {
     }
 }
 
-void ChatClient::initDatabase()
-{
-    m_db = QSqlDatabase::addDatabase("QSQLITE");
-    m_db.setDatabaseName("chathistory.db"); // 存储在运行目录
-    if (m_db.open()) {
-        QSqlQuery query;
-        // 创建消息表
-        query.exec("CREATE TABLE IF NOT EXISTS messages ("
-                   "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                   "sender TEXT, "
-                   "target TEXT, "
-                   "message TEXT, "
-                   "timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)");
-    } else {
-        qDebug() << "Database Error:" << m_db.lastError().text();
-    }
-}
-
-// chatclient.cpp
 void ChatClient::connectToServer(const QString &ip, quint16 port) {
     m_serverIp = ip;
     m_serverPort = port;
 
-    // 【关键修复】强制断开，并**同步等待**进入未连接状态
     if (m_socket->state() != QAbstractSocket::UnconnectedState) {
         m_socket->abort();
-        m_socket->waitForDisconnected(100); // 等待断开完成
+        m_socket->waitForDisconnected(100);
     }
 
-    qDebug() << "正在连接至虚拟机:" << ip << ":" << port;
+    qDebug() << "正在连接至服务器:" << ip << ":" << port;
     m_socket->connectToHost(ip, port);
 }
-void ChatClient::sendMessage(const QString &message,const QString &target) {
+
+void ChatClient::sendMessage(const QString &message, const QString &target) {
+    if (m_socket->state() != QAbstractSocket::ConnectedState) return;
+
+    // 1. 发送网络数据包包 (主线程负责网络)
+    QJsonObject json;
+    json["sender"] = m_currentUser;
+    json["message"] = message;
+    json["target"] = target;
+    m_socket->write(ProtocolHandler::pack(ProtocolHandler::MsgChat, json));
+
+
+}
+
+void ChatClient::sendidentify(const QString &username, const QString &password)
+{
     if (m_socket->state() == QAbstractSocket::ConnectedState) {
+        m_tempLoginUser = username;
         QJsonObject json;
-        json["sender"] = m_currentUser;
-        json["message"] = message;
-        json["target"]=target;
-
-        QByteArray data = QJsonDocument(json).toJson(QJsonDocument::Compact);
-        QByteArray packet;
-        QDataStream out(&packet, QIODevice::WriteOnly);
-        out.setVersion(QDataStream::Qt_6_2);
-
-        quint16 messageType = 1;
-        quint32 totalLength = sizeof(quint32) + sizeof(quint16) + data.size();
-        out << totalLength;
-        out << messageType;
-
-        // ✅ 还原成你原本正确的写法！
-        packet.append(data);
-
-        m_socket->write(packet);
-
-        m_chatModel->append(m_currentUser, message, true);
-        saveMessageToDb(m_currentUser,target,message);
+        json["username"] = username;
+        json["password"] = password;
+        m_socket->write(ProtocolHandler::pack(ProtocolHandler::MsgLoginReq, json));
     }
 }
+
+void ChatClient::addFriend(const QString &name)
+{
+    if (m_socket->state() != QAbstractSocket::ConnectedState) return;
+    QJsonObject json;
+    json["friend"] = name;
+    m_socket->write(ProtocolHandler::pack(ProtocolHandler::MsgAddFriendReq, json));
+}
+
 void ChatClient::onReadyRead() {
-    m_buffer.append(m_socket->readAll());
+    // 【科学架构体现】
+    // 主线程只做“搬运工”，读出二进制字节流后，立刻触发跨线程信号。
+    // 解包、JSON反序列化、业务逻辑判断，全部由子线程的 Worker 处理，保护 UI 绝对不卡！
+    QByteArray rawData = m_socket->readAll();
+    emit processNetworkBuffer(rawData, m_currentUser);
+}
 
-    while (true) {
-        if (m_buffer.size() < sizeof(quint32)) break;
+// ==========================================
+// 跨线程回调：工作线程处理完后的 UI 响应
+// ==========================================
 
-        QDataStream in(m_buffer);
-        in.setVersion(QDataStream::Qt_6_2);
+void ChatClient::onLoginResult(bool success, const QString &message) {
+    if (success) {
+        setCurrentUser(m_tempLoginUser);
+        // 登录成功后，下发指令让子线程去初始化此用户的专属数据库并加载历史
+        emit initializeDatabase(m_currentUser);
 
-        quint32 totalLength;
-        in >> totalLength; // 读了 4 字节，指针在 4
+    }
+    // 通知 QML 跳转页面或提示错误
+    emit loginResultReceived(success, message);
+}
 
-        if (m_buffer.size() < totalLength) break;
+void ChatClient::onHistoryLoaded(const QList<MessageRecord> &history) {
+    qDebug() << "[主线程] 接收到历史记录，数量：" << history.size() << "，准备批量更新UI。";
 
-        // --- 修正：直接读类型，不要重复读长度 ---
-        quint16 messageType;
-        in >> messageType; // 读了 2 字节，指针在 6
+    QList<ChatMessage> newMessages;
+    for (const auto &msg : history) {
+        newMessages.append({msg.sender, msg.message, (msg.sender == m_currentUser),msg.timestamp});
+    }
 
-        // 截取消息体：从第 6 个字节开始，长度是 总长 - 6
-        QByteArray messageBody = m_buffer.mid(6, totalLength - 6);
-
-        if (messageType == 1) {
-            QJsonDocument doc = QJsonDocument::fromJson(messageBody);
-            if (!doc.isNull()) {
-                QJsonObject json = doc.object();
-                QString sender = json["sender"].toString();
-                QString message = json["message"].toString();
-                QString target = json["target"].toString();
-
-                if (sender != m_currentUser) {
-                    if (target == "broadcast" || target == m_currentUser) {
-                        m_chatModel->append(sender, message, false);
-                    }
-                }
-            }
-        } else if (messageType == 2) {
-            qDebug() << "收到心跳回包";
-        }
-
-        // 处理完一个完整的包，从缓冲区移除
-        m_buffer.remove(0, totalLength);
+    m_chatModel->clear();
+    m_chatModel->appendList(newMessages); // 瞬间完成，UI 绝对不卡！
+}
+void ChatClient::onNewMessageReceived(const QString &sender, const QString &message, bool isMe, const QString &timestamp) {
+    // 子线程解析到别人的消息并入库后，通知我们画到屏幕上
+    if (isMe || sender == m_currentChatTarget || m_currentChatTarget == "broadcast") {
+        qDebug() <<("打印转发");
+        m_chatModel->append(sender, message, isMe,timestamp);
     }
 }
 
-void ChatClient::saveMessageToDb(const QString &sender, const QString &target,const QString &message) {
-    QSqlQuery query;
-    query.prepare("INSERT INTO messages (sender, target, message) VALUES (:sender, :target, :message)");
-    query.bindValue(":sender", sender);
-    query.bindValue(":target", target);
-    query.bindValue(":message", message);
-    query.exec();
+void ChatClient::onRequestIncrementalHistory(const QString &lastTimestamp) {
+    // 子线程查出本地最后一条记录的时间后，通知主线程向服务器要增量
+    QJsonObject json;
+    json["last_timestamp"] = lastTimestamp;
+    m_socket->write(ProtocolHandler::pack(ProtocolHandler::MsgHistoryReq, json));
 }
 
-void ChatClient::saveSettings()
+void ChatClient::setCurrentChatTarget(const QString &target)
 {
-    QSettings settings("MyChatApp", "QmlChatClient");
-
-    // 将当前的用户名以 "lastUser" 为键，保存起来
-    settings.setValue("lastUser", m_currentUser);
-
-    qDebug() << "保存配置：已保存当前用户 -> " << m_currentUser;
+    m_chatModel->clear(); // 先清空上一个人的聊天内容
+    m_currentChatTarget=target ;
+    // 通知 Worker 去加载这个人的历史记录
+    // 这里的具体实现取决于你的信号槽，建议发个信号给 Worker
+    emit loadInitialHistory(m_currentUser, target);
 }
 
-void ChatClient::loadSettings()
-{
-    QSettings settings("MyChatApp", "QmlChatClient");
 
-    // 读取 "lastUser" 这个键。如果键不存在（比如第一次运行），则返回一个空字符串 ""
-    QString lastUser = settings.value("lastUser", "").toString();
-
-    // 将读取到的用户名设置给 m_currentUser
-    // 注意：这里我们不再需要 main.cpp 里的随机用户名了
-    setCurrentUser(lastUser);
-
-    qDebug() << "加载配置：上次登录的用户是 -> " << m_currentUser;
-}
-
-QVariantList ChatClient::loadHistory() {
-    QVariantList history;
-    QSqlQuery query("SELECT sender, target, message FROM messages ORDER BY timestamp ASC");
-    while (query.next()) {
-        QVariantMap map;
-        QString sender = query.value(0).toString();
-        QString target = query.value(1).toString();
-        QString message = query.value(2).toString();
-
-        map["sender"] = sender;
-        map["target"] = target; // ✅ 将 target 传给 QML
-        map["message"] = message;
-        map["isMe"] = (sender == m_currentUser);
-        history.append(map);
-    }
-    return history;
-}
-
-void ChatClient::loadHistoryToModel()
-{
-    if (!m_chatModel) return;
-
-    QSqlQuery query("SELECT sender, message FROM messages ORDER BY timestamp ASC");
-    while (query.next()) {
-        QString sender = query.value(0).toString();
-        QString message = query.value(1).toString();
-        bool isMe = (sender == m_currentUser);
-
-        // 使用 model 添加历史消息
-        m_chatModel->append(sender, message, isMe);
-    }
-}
+// ==========================================
+// Socket 状态维持与基础重连逻辑
+// ==========================================
 
 void ChatClient::onConnected() {
     emit connectionStatusChanged(true);
-    if (m_reconnectTimer->isActive()) {
-        m_reconnectTimer->stop();
-    }
-
-    QByteArray packet;
-    QDataStream out(&packet, QIODevice::WriteOnly);
-    out.setVersion(QDataStream::Qt_6_2);
-
-    QJsonObject json;
-    json["sender"] = m_currentUser;
-    json["message"] = "";
-    json["target"] = "";
-
-    QByteArray data = QJsonDocument(json).toJson(QJsonDocument::Compact);
-    quint16 messageType = 3;
-    quint32 totalLength = sizeof(quint32) + sizeof(quint16) + data.size();
-
-    out << totalLength;
-    out << messageType;
-
-    // ✅ 还原成你原本正确的写法！
-    packet.append(data);
-
-    m_socket->write(packet);
+    if (m_reconnectTimer->isActive()) m_reconnectTimer->stop();
 
     m_currentReconnectDelay = 1000;
-    qDebug() << "✅ 連線成功！重連延遲已重置為初始值。";
+    qDebug() << "✅ 连线成功！心跳机制已启动。";
 
     m_heartbeatTimer->start(10000);
     m_heartbeatTimeoutTimer->start(30000);
-    qDebug() << "❤️ 心跳机制已启动。";
 }
+
 void ChatClient::onDisconnected() {
     emit connectionStatusChanged(false);
     m_heartbeatTimer->stop();
     m_heartbeatTimeoutTimer->stop();
 
     if (!m_reconnectTimer->isActive()) {
-        qDebug() << "❌ 連接斷開，將在" << m_currentReconnectDelay / 1000.0 << "秒後嘗試重新連線...";
+        qDebug() << "❌ 连接断开，将尝试重新连线...";
         m_reconnectTimer->start(m_currentReconnectDelay);
     }
 }
 
 void ChatClient::attemptReconnection()
 {
-    qDebug() << "🔄 正在嘗試重新連線...";
-
-    // ✅ 关键：如果 Socket 还卡在上次的连接状态中，先强制中断它，保证每次尝试都是干净的
-    if (m_socket->state() != QAbstractSocket::UnconnectedState) {
-        m_socket->abort();
-    }
-
-    // 发起连接
+    qDebug() << "🔄 正在尝试重新连线...";
+    if (m_socket->state() != QAbstractSocket::UnconnectedState) m_socket->abort();
     connectToServer(m_serverIp, m_serverPort);
 
-    // ✅ 指数退让算法：将下一次的重连延迟时间翻倍（* 2）
+    // 指数退让算法
     m_currentReconnectDelay *= 2;
-
-    // ✅ 封顶限制：不能让它无限增大，最大不超过 MAX_RECONNECT_DELAY (60秒)
     if (m_currentReconnectDelay > MAX_RECONNECT_DELAY) {
         m_currentReconnectDelay = MAX_RECONNECT_DELAY;
     }
-
-    // ✅ 启动下一次的重连定时器。
-    // 如果刚才的 connectToServer 成功了，onConnected() 会把这个定时器停掉。
-    // 如果一直没连上，这个定时器就会在新的、更长的时间后再次触发本函数。
-    // qDebug() << "如果本次失敗，下次將在" << m_currentReconnectDelay / 1000.0 << "秒後重試...";
-    // m_reconnectTimer->start(m_currentReconnectDelay);
 }
 
 void ChatClient::sendHeartbeat()
 {
     if (m_socket->state() == QAbstractSocket::ConnectedState) {
-        QByteArray packet;
-        QDataStream out(&packet, QIODevice::WriteOnly);
-        out.setVersion(QDataStream::Qt_6_2);
-
-        quint16 messageType = 2; // 2 代表心跳包
-        // 心跳包没有数据体，所以长度只有 长度字段本身 + 消息类型字段
-        quint32 totalLength = sizeof(quint32) + sizeof(quint16);
-        out << totalLength;
-        out << messageType;
-
-        m_socket->write(packet);
-        // qDebug() << "已发送心跳 Ping..."; // 可选：打印日志
+        m_socket->write(ProtocolHandler::pack(ProtocolHandler::MsgHeartbeat));
     }
 }
 
 void ChatClient::onHeartbeatTimeout()
 {
-    qDebug() << "❌ 心跳超时！长时间未收到服务器数据，判定为死链接，准备断开重连...";
-    // abort() 会立即强制关闭 Socket，并触发 disconnected 信号
-    // 这将自动引导程序进入你已有的 onDisconnected() 重连逻辑
     m_socket->abort();
 }
 
 void ChatClient::onErrorOccurred(QAbstractSocket::SocketError socketError) {
-    qDebug() << "❌ Socket 错误代码:" << socketError;
-    qDebug() << "❌ 真实错误：" << m_socket->errorString();
-    qDebug() << "❌ Socket 错误代码:" << socketError;
-    // 只有在连接相关错误时，才启动重连
+    qDebug() << "❌ Socket 错误代码:" << socketError << " | 原因:" << m_socket->errorString();
     if (socketError == QAbstractSocket::ConnectionRefusedError ||
         socketError == QAbstractSocket::HostNotFoundError ||
         socketError == QAbstractSocket::RemoteHostClosedError)
     {
-        // 关键：如果重连定时器没在跑，就启动它！
         if (!m_reconnectTimer->isActive()) {
-            qDebug() << "准备启动重连逻辑...";
             m_reconnectTimer->start(m_currentReconnectDelay);
         }
     }
+}
+
+void ChatClient::saveSettings()
+{
+    QSettings settings("MyChatApp", "QmlChatClient");
+    settings.setValue("server/ip", m_serverIp);
+    settings.setValue("server/port", m_serverPort);
+}
+
+void ChatClient::loadSettings()
+{
+    QSettings settings("MyChatApp", "QmlChatClient");
+    QString lastUser = settings.value("lastUser", "").toString();
+    setCurrentUser(lastUser);
 }

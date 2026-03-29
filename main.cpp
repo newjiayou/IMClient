@@ -8,13 +8,14 @@
 int main(int argc, char *argv[])
 {
     QGuiApplication app(argc, argv);
-
+    app.setOrganizationName("MyChatApp");
+    app.setApplicationName("QmlChatClient");
     ChatClient chatClient;
     if(chatClient.currentUser()=="")
     {
         chatClient.setCurrentUser("User_" + QString::number(QDateTime::currentMSecsSinceEpoch() % 1000));
     }
-
+    chatClient.loadConfigAndConnect();
     QQmlApplicationEngine engine;
 
     // 【修改 1】：暴露 chatClient 给 QML
