@@ -11,6 +11,6 @@ ApplicationWindow
     StackView{
         id:stackView
         anchors.fill:parent
-        initialItem: "regist.qml"
+        initialItem: "login.qml"
     }
 }

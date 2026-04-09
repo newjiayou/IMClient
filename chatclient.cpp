@@ -13,7 +13,7 @@ ChatClient::ChatClient(QObject *parent) : QObject(parent), m_socket(new QTcpSock
 {
     m_chatModel = new chatmodel(this);
     m_socket->setProxy(QNetworkProxy::NoProxy);
-
+    m_networkManager = new QNetworkAccessManager(this);
     // 1. 初始化各类定时器
     m_currentReconnectDelay = 1000;
     m_reconnectTimer = new QTimer(this);
@@ -83,7 +83,7 @@ void ChatClient::loadConfigAndConnect()
 {
     QSettings settings("MyChatApp", "QmlChatClient");
     QString serverIp = settings.value("server/ip", "192.168.56.101").toString();
-    quint16 serverPort = static_cast<quint16>(settings.value("server/port", 12345).toUInt());
+    quint16 serverPort = static_cast<quint16>(settings.value("server/port", 12346).toUInt());
     connectToServer(serverIp, serverPort);
 }
 
@@ -197,6 +197,40 @@ void ChatClient::setCurrentChatTarget(const QString &target)
     // 通知 Worker 去加载这个人的历史记录
     // 这里的具体实现取决于你的信号槽，建议发个信号给 Worker
     emit loadInitialHistory(m_currentUser, target);
+}
+
+void ChatClient::registerAccount(const QString &username, const QString &password) {
+    // 1. 准备请求 (指向 Nginx 监听的 80 端口)
+    QUrl url("http://192.168.56.101/api/register"); // 换成你的虚拟机IP
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+
+    // 2. 构建 JSON 数据
+    QJsonObject json;
+    json["username"] = username;
+    json["password"] = password;
+    QJsonDocument doc(json);
+    QByteArray data = doc.toJson();
+
+    // 3. 发送 POST 请求
+    QNetworkReply *reply = m_networkManager->post(request, data);
+
+    // 4. 处理响应
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        if (reply->error() == QNetworkReply::NoError) {
+            // 状态码 200 表示成功
+            emit registerResultReceived(true, "注册成功！");
+        } else {
+            // 处理具体错误
+            int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            if (statusCode == 409) {
+                emit registerResultReceived(false, "用户名已存在");
+            } else {
+                emit registerResultReceived(false, "连接服务器失败");
+            }
+        }
+        reply->deleteLater();
+    });
 }
 
 

@@ -27,10 +27,11 @@ qt_add_resources(appQmlChatApp "app_resources"
     FILES
         Main.qml
         chat.qml
-        regist.qml
+        login.qml
         logintest.jpg
         desktop.qml
         AddFriendPage.qml
+        regist.qml
 )
 
 # 3. 链接 Qt 库

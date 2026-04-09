@@ -12,6 +12,8 @@
 #include "protocolhandler.h"
 #include <QSettings>         // [新增] 引入QSettings头文件，用于读写配置
 #include <QThread>           // [新增] 引入多线程支持
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
 
 class BackendWorker;         // 前向聲明
 struct MessageRecord;        // 前向聲明
@@ -39,6 +41,7 @@ public:
     Q_INVOKABLE void addFriend(const QString &name);
     QStringList friendList() const { return m_friendList; }
     Q_INVOKABLE void setCurrentChatTarget(const QString &target);
+    Q_INVOKABLE void registerAccount(const QString &username, const QString &password);
 
 signals:
     void currentUserChanged();
@@ -51,6 +54,7 @@ signals:
     void processNetworkBuffer(QByteArray buffer, const QString &currentUser);
     void friendListChanged();
     void friendActionResults(bool success, const QString &message);
+    void registerResultReceived(bool success, const QString &message);
 
 
 private slots:
@@ -90,7 +94,7 @@ private:
     QThread* m_workerThread;
     BackendWorker* m_worker;
     QString m_currentChatTarget; // 必须添加这一行来跟踪当前正在和谁聊
-
+    QNetworkAccessManager *m_networkManager; // 专门处理 HTTP (注册
     QStringList m_friendList;
 };
 

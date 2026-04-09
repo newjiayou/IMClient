@@ -59,6 +59,7 @@ void BackendWorker::onProcessNetworkBuffer(QByteArray buffer, const QString &cur
             {
                 SaveOutgoingMessage(sender,target,message,timestamp);
                 qDebug() <<("存入自己写的消息");
+                emit newMessageReceived(sender, message, true, timestamp);
             }
             break;
         }

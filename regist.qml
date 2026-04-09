@@ -3,115 +3,206 @@ import QtQuick.Controls
 import QtQuick.Layouts
 
 Page {
-    id: loginPage
-    title: "登录"
-    // 【新增 1】定义一个内部状态变量，用来控制按钮状态和文字显示
-    property bool isLoggingIn: false
+    id: registerPage
+    title: "用户注册"
 
-    // 【新增 2】监听来自 C++ ChatClient 的信号
+    // 控制页面交互状态的属性
+    property bool isRegistering: false
+
+    // 【核心】监听 C++ ChatClient 传回的注册结果信号
     Connections {
-        target: chatClient // 确保你的 main.cpp 中将 ChatClient 实例设为 qmlContext 的属性
+        target: chatClient // 确保 main.cpp 中已将 chatClient 注册为上下文属性
 
-        // 对应 C++ 中声明的信号 void loginResultReceived(bool success, const QString &message)
-        function onLoginResultReceived(success, message) {
-            // 只要收到回复（无论成败），就停止“登录中”状态
-            isLoggingIn = false
+        // 对应 C++: void registerResultReceived(bool success, const QString &message)
+        function onRegisterResultReceived(success, message) {
+            isRegistering = false // 收到回复，解除界面锁定
+
+            statusLabel.text = message
+            statusLabel.color = success ? "#07C160" : "red" // 成功绿色，失败红色
 
             if (success) {
-                console.log("登录成功，正在跳转...")
-                // 【核心修改】只有在这里，收到服务端确认后，才允许跳转
-                if (loginPage.StackView.view) {
-                    // loginPage.StackView.view.push("qrc:/chat.qml")
-                    loginPage.StackView.view.push("qrc:/desktop.qml")
-                }
-            } else {
-                // 登录失败，显示错误信息
-                errorLabel.text = message
-                errorLabel.visible = true
+                // 注册成功：清空输入并延迟 2 秒返回登录页
+                regUserField.text = ""
+                regPasswordField.text = ""
+                regConfirmField.text = ""
+                autoBackTimer.start()
             }
         }
     }
 
-    background: Rectangle {
-        color: "#f0f0f0"
+    // 顶部导航栏
+    header: ToolBar {
+        background: Rectangle { color: "#f8f8f8" }
+        RowLayout {
+            anchors.fill: parent
+            ToolButton {
+                text: "‹ 返回登录"
+                enabled: !isRegistering
+                onClicked: registerPage.StackView.view.pop()
+            }
+            Label {
+                text: "新用户注册"
+                elide: Label.ElideRight
+                verticalAlignment: Qt.AlignVCenter
+                horizontalAlignment: Qt.AlignHCenter
+                Layout.fillWidth: true
+                font.bold: true
+                font.pixelSize: 18
+            }
+            Item { Layout.preferredWidth: 40 } // 占位，保持标题居中
+        }
     }
 
+    // 主背景
+    background: Rectangle {
+        color: "#ffffff"
+    }
+
+    // 页面内容布局
     ColumnLayout {
         anchors.centerIn: parent
-        spacing: 20
-        width: parent.width * 0.8
+        width: parent.width * 0.85
+        spacing: 15
 
-        Image {
-            source: "logintest.jpg"
-            Layout.preferredWidth: 120
-            Layout.preferredHeight: 120
-            fillMode: Image.PreserveAspectFit
+        // 图标或占位
+        Text {
+            text: "📝"
+            font.pixelSize: 60
             Layout.alignment: Qt.AlignHCenter
         }
 
         Text {
-            text: "欢迎登录"
-            font.pixelSize: 24
+            text: "创建新账号"
+            font.pixelSize: 22
             font.bold: true
             Layout.alignment: Qt.AlignHCenter
+            bottomPadding: 10
         }
 
+        // 账号输入框
         TextField {
-            id: usernameField
-            placeholderText: "请输入账号"
+            id: regUserField
+            placeholderText: "请输入用户名"
             Layout.fillWidth: true
-            // 登录中时禁止输入
-            enabled: !isLoggingIn
+            enabled: !isRegistering
+            selectByMouse: true
+            background: Rectangle {
+                implicitHeight: 45
+                border.color: regUserField.activeFocus ? "#07C160" : "#ddd"
+                radius: 4
+            }
         }
 
+        // 密码输入框
         TextField {
-            id: passwordField
-            placeholderText: "请输入密码"
+            id: regPasswordField
+            placeholderText: "设置密码"
             echoMode: TextInput.Password
             Layout.fillWidth: true
-            // 登录中时禁止输入
-            enabled: !isLoggingIn
+            enabled: !isRegistering
+            selectByMouse: true
+            background: Rectangle {
+                implicitHeight: 45
+                border.color: regPasswordField.activeFocus ? "#07C160" : "#ddd"
+                radius: 4
+            }
         }
 
-        // 【新增 3】错误提示文本（默认隐藏）
-        Text {
-            id: errorLabel
-            color: "red"
-            text: ""
-            visible: false
-            Layout.alignment: Qt.AlignHCenter
-        }
-
-        Button {
-            id: loginButton
-            // 【新增 4】动态切换文字和禁用状态
-            text: isLoggingIn ? "正在验证..." : "登录"
-            enabled: !isLoggingIn // 登录中禁止重复点击
-
+        // 确认密码输入框
+        TextField {
+            id: regConfirmField
+            placeholderText: "确认密码"
+            echoMode: TextInput.Password
             Layout.fillWidth: true
-            highlighted: true
+            enabled: !isRegistering
+            selectByMouse: true
+            background: Rectangle {
+                implicitHeight: 45
+                border.color: regConfirmField.activeFocus ? "#07C160" : "#ddd"
+                radius: 4
+            }
+        }
+
+        // 状态/错误信息提示
+        Text {
+            id: statusLabel
+            text: ""
+            Layout.fillWidth: true
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.Wrap
+            font.pixelSize: 14
+            visible: text !== ""
+        }
+
+        // 间距占位
+        Item { Layout.preferredHeight: 10 }
+
+        // 注册提交按钮
+        Button {
+            id: submitBtn
+            text: isRegistering ? "提交中..." : "立即注册"
+            Layout.fillWidth: true
+            Layout.preferredHeight: 48
+            enabled: !isRegistering && regUserField.text !== "" && regPasswordField.text !== ""
+
+            contentItem: Text {
+                text: submitBtn.text
+                color: "white"
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+                font.bold: true
+                font.pixelSize: 16
+            }
+
+            background: Rectangle {
+                color: submitBtn.enabled ? (submitBtn.pressed ? "#06ad56" : "#07C160") : "#ccc"
+                radius: 4
+            }
 
             onClicked: {
-                // 1. 基础校验
-                let uname = usernameField.text.trim()
-                let pwd = passwordField.text.trim()
+                let u = regUserField.text.trim()
+                let p = regPasswordField.text.trim()
+                let cp = regConfirmField.text.trim()
 
-                if (uname === "" || pwd === "") {
-                    errorLabel.text = "账号或密码不能为空"
-                    errorLabel.visible = true
+                // 1. 本地逻辑校验
+                if (u.length < 3) {
+                    statusLabel.text = "用户名至少需要 3 个字符"
+                    statusLabel.color = "red"
                     return
                 }
 
-                // 2. 隐藏之前的错误，进入“登录中”状态
-                errorLabel.visible = false
-                isLoggingIn = true
+                if (p !== cp) {
+                    statusLabel.text = "两次输入的密码不一致"
+                    statusLabel.color = "red"
+                    return
+                }
 
-                // 3. 【核心修改】只负责发消息，不负责跳转
-                // 发送 Type=4 的 JSON 包给服务器
-                chatClient.sendidentify(uname, pwd)
+                // 2. 进入注册中状态，调用 C++ 接口
+                statusLabel.text = "正在连接 Nginx 网关..."
+                statusLabel.color = "blue"
+                isRegistering = true
 
-                // 注意：这里删除了 chatClient.currentUser = uname
-                // 建议在 C++ 端确认 success 后再设置 currentUser
+                // 调用 ChatClient 中你增加的 registerAccount 函数
+                chatClient.registerAccount(u, p)
+            }
+        }
+
+        // 辅助说明
+        Text {
+            text: "点击注册即表示同意用户协议"
+            font.pixelSize: 12
+            color: "#999"
+            Layout.alignment: Qt.AlignHCenter
+        }
+    }
+
+    // 成功注册后的自动返回定时器
+    Timer {
+        id: autoBackTimer
+        interval: 2000
+        onTriggered: {
+            if (registerPage.StackView.view) {
+                registerPage.StackView.view.pop()
             }
         }
     }
